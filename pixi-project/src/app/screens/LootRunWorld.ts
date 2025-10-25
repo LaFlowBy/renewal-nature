@@ -6,6 +6,7 @@ import { ExtractionPoint } from "../game/ExtractionPoint";
 import { InputController } from "../game/InputController";
 import { Player } from "../game/Player";
 import { LootContainer } from "../game/LootContainer";
+import { Building } from "../game/Building";
 import { InventoryUI } from "../ui/InventoryUI";
 import { LootContainerUI } from "../ui/LootContainerUI";
 
@@ -17,17 +18,20 @@ export class LootRunWorld extends Container {
   private player: Player;
   private extractionPoints: ExtractionPoint[] = [];
   private inputController: InputController;
-  private worldBounds = { width: 2000, height: 1500 };
+  private worldBounds = { width: 2400, height: 2000 };
   private camera: Container;
   private ground: Graphics;
   private uiContainer: Container;
   private statusText: Text;
   private inventoryText: Text;
   private lootContainers: LootContainer[] = [];
+  private buildings: Building[] = [];
   private inventoryUI: InventoryUI;
   private lootContainerUI: LootContainerUI;
   private currentOpenContainer: LootContainer | null = null;
   private currentLootSlotIndex = 0;
+  private currentBuilding: Building | null = null;
+  private fogOverlay: Graphics;
 
   constructor() {
     super();
@@ -40,11 +44,10 @@ export class LootRunWorld extends Container {
     this.ground = new Graphics();
     this.ground.rect(0, 0, this.worldBounds.width, this.worldBounds.height);
     this.ground.fill({ color: 0x2a2a2a }); // Dark gray
-
-    // Add buildings/structures as obstacles
-    this.createEnvironment();
-
     this.camera.addChild(this.ground);
+
+    // Generate procedural environment
+    this.generateProceduralWorld();
 
     // Create player
     this.player = new Player();
@@ -52,11 +55,12 @@ export class LootRunWorld extends Container {
     this.player.y = 200;
     this.camera.addChild(this.player);
 
-    // Create extraction points
-    this.createExtractionPoints();
-
-    // Create loot containers
-    this.createLootContainers();
+    // Create fog overlay (initially hidden)
+    this.fogOverlay = new Graphics();
+    this.fogOverlay.rect(0, 0, this.worldBounds.width, this.worldBounds.height);
+    this.fogOverlay.fill({ color: 0x000000, alpha: 0.7 });
+    this.fogOverlay.visible = false;
+    this.camera.addChild(this.fogOverlay);
 
     // Create UI
     this.uiContainer = new Container();
@@ -98,7 +102,7 @@ export class LootRunWorld extends Container {
     this.uiContainer.addChild(warningText);
 
     const controlsText = new Text({
-      text: "E: Open/Close Container | F: Take Item | TAB: Inventory | Arrows: Navigate",
+      text: "E: Open/Interact | F: Take Item | TAB: Inventory | Arrows: Navigate",
       style: {
         fontSize: 14,
         fill: 0xcccccc,
@@ -140,9 +144,65 @@ export class LootRunWorld extends Container {
     if (this.lootContainerUI.visible) {
       // Close loot container
       this.closeLootContainer();
+      return;
+    }
+
+    // Try to enter/exit building
+    for (const building of this.buildings) {
+      if (building.checkPlayerProximity(this.player.x, this.player.y)) {
+        this.enterBuilding(building);
+        return;
+      }
+    }
+
+    // Try to open a container
+    this.tryOpenLootContainer();
+  }
+
+  private enterBuilding(building: Building) {
+    if (this.currentBuilding === building) {
+      // Exit building
+      const exitPos = building.getExteriorSpawnPoint();
+      this.player.x = exitPos.x;
+      this.player.y = exitPos.y;
+      this.currentBuilding = null;
+
+      // Hide fog overlay
+      this.fogOverlay.visible = false;
+
+      // Ensure player is visible and on top layer
+      this.camera.removeChild(this.player);
+      this.camera.addChild(this.player);
+
+      console.log("Exited building");
     } else {
-      // Try to open a container
-      this.tryOpenLootContainer();
+      // Enter building
+      const enterPos = building.getInteriorSpawnPoint();
+      this.player.x = enterPos.x;
+      this.player.y = enterPos.y;
+      this.currentBuilding = building;
+
+      // Show fog overlay to hide outside
+      this.fogOverlay.visible = true;
+
+      // Reorganize layers: fog should be below player and current building
+      // Remove and re-add to ensure correct order
+      this.camera.removeChild(building);
+      this.camera.removeChild(this.player);
+
+      // Add back in correct order (building above fog, player above building)
+      this.camera.addChild(building);
+      this.camera.addChild(this.player);
+
+      // Move loot containers inside this building above fog
+      for (const container of this.lootContainers) {
+        if (building.isPlayerInsideBuilding(container.x, container.y)) {
+          this.camera.removeChild(container);
+          this.camera.addChild(container);
+        }
+      }
+
+      console.log("Entered building");
     }
   }
 
@@ -233,34 +293,132 @@ export class LootRunWorld extends Container {
     }
   }
 
-  private createEnvironment() {
-    // Add some buildings/structures
-    const buildings = [
-      { x: 400, y: 300, width: 200, height: 150 },
-      { x: 900, y: 400, width: 250, height: 200 },
-      { x: 1200, y: 800, width: 180, height: 180 },
-      { x: 600, y: 900, width: 220, height: 160 },
-      { x: 1500, y: 500, width: 200, height: 200 },
-    ];
+  private generateProceduralWorld() {
+    const numBuildings = 5 + Math.floor(Math.random() * 5); // 5-9 buildings
+    const minBuildingDistance = 500;
+    const safeSpawnRadius = 400; // Keep spawn area clear
+    const buildingPositions: {
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+    }[] = [];
 
-    buildings.forEach((building) => {
-      this.ground.rect(building.x, building.y, building.width, building.height);
-      this.ground.fill({ color: 0x1a1a1a });
-      this.ground.stroke({ color: 0x444444, width: 2 });
-    });
+    // Generate buildings
+    for (let i = 0; i < numBuildings; i++) {
+      let attempts = 0;
+      let validPosition = false;
+      let bx, by, bw, bh;
 
-    // Add some debris/details
-    for (let i = 0; i < 100; i++) {
+      while (!validPosition && attempts < 50) {
+        bw = 150 + Math.random() * 200; // Width: 150-350
+        bh = 150 + Math.random() * 200; // Height: 150-350
+        bx = 100 + Math.random() * (this.worldBounds.width - bw - 200);
+        by = 100 + Math.random() * (this.worldBounds.height - bh - 200);
+
+        // Check distance from spawn
+        const distFromSpawn = Math.sqrt(
+          Math.pow(bx - 200, 2) + Math.pow(by - 200, 2)
+        );
+        if (distFromSpawn < safeSpawnRadius) {
+          attempts++;
+          continue;
+        }
+
+        // Check distance from other buildings
+        validPosition = true;
+        for (const existing of buildingPositions) {
+          const distX = Math.abs(bx - existing.x);
+          const distY = Math.abs(by - existing.y);
+          if (distX < minBuildingDistance && distY < minBuildingDistance) {
+            validPosition = false;
+            break;
+          }
+        }
+
+        attempts++;
+      }
+
+      if (validPosition) {
+        buildingPositions.push({ x: bx!, y: by!, width: bw!, height: bh! });
+
+        // Random door side
+        const doorSides: ("left" | "right" | "top" | "bottom")[] = [
+          "left",
+          "right",
+          "top",
+          "bottom",
+        ];
+        const doorSide =
+          doorSides[Math.floor(Math.random() * doorSides.length)];
+
+        const building = new Building(bx!, by!, bw!, bh!, doorSide);
+        this.buildings.push(building);
+        this.camera.addChild(building);
+
+        // Add loot containers inside the building
+        const numInteriorContainers = 1 + Math.floor(Math.random() * 3); // 1-3 containers per building
+        for (let j = 0; j < numInteriorContainers; j++) {
+          const cx =
+            building.interiorBounds.x +
+            30 +
+            Math.random() * (building.interiorBounds.width - 60);
+          const cy =
+            building.interiorBounds.y +
+            30 +
+            Math.random() * (building.interiorBounds.height - 60);
+          const container = new LootContainer(cx, cy);
+          this.lootContainers.push(container);
+          this.camera.addChild(container);
+        }
+
+        // Add loot containers outside the building (1-2 per building)
+        const numExteriorContainers = 1 + Math.floor(Math.random() * 2);
+        for (let j = 0; j < numExteriorContainers; j++) {
+          const side = Math.floor(Math.random() * 4);
+          let cx, cy;
+
+          switch (side) {
+            case 0: // Top
+              cx = bx! + Math.random() * bw!;
+              cy = by! - 40 - Math.random() * 30;
+              break;
+            case 1: // Bottom
+              cx = bx! + Math.random() * bw!;
+              cy = by! + bh! + 40 + Math.random() * 30;
+              break;
+            case 2: // Left
+              cx = bx! - 40 - Math.random() * 30;
+              cy = by! + Math.random() * bh!;
+              break;
+            default: // Right
+              cx = bx! + bw! + 40 + Math.random() * 30;
+              cy = by! + Math.random() * bh!;
+              break;
+          }
+
+          const container = new LootContainer(cx, cy);
+          this.lootContainers.push(container);
+          this.camera.addChild(container);
+        }
+      }
+    }
+
+    // Add debris/details
+    for (let i = 0; i < 150; i++) {
       const x = Math.random() * this.worldBounds.width;
       const y = Math.random() * this.worldBounds.height;
       const size = 3 + Math.random() * 8;
       this.ground.circle(x, y, size);
       this.ground.fill({ color: 0x3a3a3a, alpha: 0.5 });
     }
+
+    // Create extraction points (always 3)
+    this.createExtractionPoints();
   }
 
   private createExtractionPoints() {
-    // Create 3 extraction points
+    // Always create exactly 3 extraction points in different areas
     const points = [
       { x: this.worldBounds.width - 300, y: 300 },
       { x: 300, y: this.worldBounds.height - 300 },
@@ -274,30 +432,26 @@ export class LootRunWorld extends Container {
     });
   }
 
-  private createLootContainers() {
-    // Create 10 loot containers scattered around
-    const positions = [
-      { x: 500, y: 400 },
-      { x: 800, y: 600 },
-      { x: 1100, y: 300 },
-      { x: 1400, y: 700 },
-      { x: 700, y: 1000 },
-      { x: 400, y: 700 },
-      { x: 1600, y: 400 },
-      { x: 300, y: 1100 },
-      { x: 1300, y: 1100 },
-      { x: 900, y: 900 },
-    ];
-
-    positions.forEach((pos) => {
-      const container = new LootContainer(pos.x, pos.y);
-      this.lootContainers.push(container);
-      this.camera.addChild(container);
-    });
-  }
-
   public prepare() {
-    // Reset loot run state
+    // Reset loot run state - regenerate world each time
+    this.buildings.forEach((b) => b.destroy());
+    this.buildings = [];
+    this.lootContainers.forEach((c) => c.destroy());
+    this.lootContainers = [];
+    this.extractionPoints.forEach((e) => e.destroy());
+    this.extractionPoints = [];
+
+    // Clear ground graphics
+    this.ground.clear();
+    this.ground.rect(0, 0, this.worldBounds.width, this.worldBounds.height);
+    this.ground.fill({ color: 0x2a2a2a });
+
+    // Regenerate world
+    this.generateProceduralWorld();
+
+    // Reset player position
+    this.player.x = 200;
+    this.player.y = 200;
   }
 
   public update(time: Ticker) {
@@ -308,7 +462,46 @@ export class LootRunWorld extends Container {
       // Update input
       const movement = this.inputController.getMovementVector();
       this.player.setMovement(movement.x, movement.y);
+
+      // Store old position for collision detection
+      const oldX = this.player.x;
+      const oldY = this.player.y;
+
       this.player.update(deltaTime);
+
+      // Check collision with buildings
+      const playerRadius = 20; // Player's visual radius
+
+      if (this.currentBuilding) {
+        // Player is inside a building - keep them within interior bounds
+        const bounds = this.currentBuilding.interiorBounds;
+        if (
+          this.player.x - playerRadius < bounds.x ||
+          this.player.x + playerRadius > bounds.x + bounds.width ||
+          this.player.y - playerRadius < bounds.y ||
+          this.player.y + playerRadius > bounds.y + bounds.height
+        ) {
+          // Player trying to leave interior - revert to old position
+          this.player.x = oldX;
+          this.player.y = oldY;
+        }
+      } else {
+        // Player is outside - check collision with building exteriors
+        for (const building of this.buildings) {
+          if (
+            this.player.x + playerRadius > building.x &&
+            this.player.x - playerRadius <
+              building.x + building.buildingWidth &&
+            this.player.y + playerRadius > building.y &&
+            this.player.y - playerRadius < building.y + building.buildingHeight
+          ) {
+            // Collision detected - revert to old position
+            this.player.x = oldX;
+            this.player.y = oldY;
+            break;
+          }
+        }
+      }
 
       // Keep player in bounds
       this.player.x = Math.max(
@@ -339,6 +532,11 @@ export class LootRunWorld extends Container {
     // Update loot containers
     this.lootContainers.forEach((container) => {
       container.checkPlayerProximity(this.player.x, this.player.y);
+    });
+
+    // Update buildings
+    this.buildings.forEach((building) => {
+      building.checkPlayerProximity(this.player.x, this.player.y);
     });
 
     // Update inventory UI
